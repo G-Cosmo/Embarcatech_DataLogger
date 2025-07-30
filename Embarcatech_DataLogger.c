@@ -37,6 +37,11 @@
 #define I2C_SCL_DISP 15
 #define ENDERECO_DISP 0x3C            // Endereço I2C do display
 
+#define ButtonB 6
+#define ButtonA 5
+
+uint32_t last_time = 0;
+
 ssd1306_t ssd;
 bool cor = true;
 char op[50];
@@ -55,7 +60,26 @@ static int addr = 0x68;
 
 int16_t acceleration[3], gyro[3], temp;
 
+int led[3] = {13,11,12};
 
+bool interrupt_flag = false; //se false pode interromper, se true operação em andamento
+bool mounted = false;
+bool button_a_pressed = false;
+bool button_b_pressed = false;
+
+volatile int opt = -1;
+
+
+void init_leds()
+{
+    gpio_init(led[0]);
+    gpio_init(led[1]);
+    gpio_init(led[2]);
+
+    gpio_set_dir(led[0], GPIO_OUT);
+    gpio_set_dir(led[1], GPIO_OUT);
+    gpio_set_dir(led[2], GPIO_OUT);
+}
 
 static void mpu6050_reset()
 {
@@ -144,14 +168,6 @@ void capture_mpu_data_and_save()
     printf("\nDados do MPU salvos no arquivo CSV %s.\n\n", filename);
 }
 
-// Trecho para modo BOOTSEL com botão B
-#include "pico/bootrom.h"
-#define botaoB 6
-void gpio_irq_handler(uint gpio, uint32_t events)
-{
-    reset_usb_boot(0, 0);
-}
-
 void print_error()
 {
     ssd1306_fill(&ssd, !cor);
@@ -176,18 +192,55 @@ void print_op(bool done)
     }
 }
 
+void clear_led()
+{
+    gpio_put(led[0], false);
+    gpio_put(led[1], false);
+    gpio_put(led[2], false);
+}
+
+void gpio_irq_handler(uint gpio, uint32_t events)
+{
+    uint32_t new_time = to_ms_since_boot(get_absolute_time());
+
+    if(new_time - last_time > 500 && !interrupt_flag)
+    {
+        if(gpio == ButtonA)
+        {
+            button_a_pressed = true;
+        }
+        else if(gpio == ButtonB)
+        {
+            button_b_pressed = true;
+        }
+        
+        last_time = new_time;
+    }
+}
+
 
 int main()
 {
-    // Para ser utilizado o modo BOOTSEL com botão B
-    gpio_init(botaoB);
-    gpio_set_dir(botaoB, GPIO_IN);
-    gpio_pull_up(botaoB);
-    gpio_set_irq_enabled_with_callback(botaoB, GPIO_IRQ_EDGE_FALL, true, &gpio_irq_handler);
+    gpio_init(ButtonB);
+    gpio_set_dir(ButtonB, GPIO_IN);
+    gpio_pull_up(ButtonB);
+
+    gpio_init(ButtonA);
+    gpio_set_dir(ButtonA, GPIO_IN);
+    gpio_pull_up(ButtonA);
+
+    gpio_set_irq_enabled_with_callback(ButtonB, GPIO_IRQ_EDGE_FALL, true, &gpio_irq_handler);
+    gpio_set_irq_enabled_with_callback(ButtonA, GPIO_IRQ_EDGE_FALL, true, &gpio_irq_handler);
 
     stdio_init_all();
-    sleep_ms(5000);
+    init_leds();
+
+    gpio_put(led[0], true);
+    gpio_put(led[1], true);
+
+    sleep_ms(3000);
     time_init();
+
 
     // Inicializa a I2C do Display OLED em 400kHz
     i2c_init(I2C_PORT_DISP, 400 * 1000);
@@ -224,84 +277,189 @@ int main()
     ssd1306_draw_string(&ssd, "Comando...", 4, 13);
     ssd1306_send_data(&ssd);
 
+    gpio_put(led[0], false);
+
     bi_decl(bi_2pins_with_func(I2C_SDA, I2C_SCL, GPIO_FUNC_I2C));
     mpu6050_reset();
     
     while (true)
     {
 
-        int cRxedChar = getchar_timeout_us(0);
-        if (PICO_ERROR_TIMEOUT != cRxedChar)
-            process_stdio(cRxedChar);
+        if(button_a_pressed && !interrupt_flag)
+        {
+            opt = 'f';
+            button_a_pressed = false; // Limpa o flag
+        }
+        
+        if(button_b_pressed && !interrupt_flag)
+        {
+            if(mounted)
+            {
+                opt = 'b';
+            }
+            else
+            {
+                opt = 'a';
+            }
+            button_b_pressed = false; // Limpa o flag
+        }
 
-        if (cRxedChar == 'a') // Monta o SD card se pressionar 'a'
+        // Processa entrada serial
+        int serial_input = getchar_timeout_us(0);
+        if (PICO_ERROR_TIMEOUT != serial_input)
+        {
+            opt = serial_input;
+            process_stdio(opt);
+        }
+
+        if (opt == 'a') // Monta o SD card se pressionar 'a'
         {
             printf("\nMontando o SD...\n");
             strcpy(op, "Montando SD...");
             print_op(false);
+
+            clear_led();
+            gpio_put(led[0], true);
+            gpio_put(led[1], true);
+
+            interrupt_flag = true;
+
             run_mount();
+
             if(err_flag)
             {
                 print_error();
+                clear_led();
+                gpio_put(led[0], true);
+
             }else
             {
                 print_op(true);
+                clear_led();
+                gpio_put(led[1], true);
             }
+
+            interrupt_flag = false;
+            mounted = true;
+
+            opt = -1;
             printf("\nEscolha o comando (h = help):  ");
         }
-        if (cRxedChar == 'b') // Desmonta o SD card se pressionar 'b'
+        if (opt == 'b') // Desmonta o SD card se pressionar 'b'
         {
             printf("\nDesmontando o SD. Aguarde...\n");
             strcpy(op, "Desmontando SD...");
             print_op(false);
+
+            clear_led();
+            gpio_put(led[0], true);
+            gpio_put(led[1], true);
+
+            interrupt_flag = true;
+
             run_unmount();
+
             if(err_flag)
             {
                 print_error();
+                clear_led();
+                gpio_put(led[0], true);
+
             }else
             {
                 print_op(true);
+                clear_led();
+                gpio_put(led[1], true);
             }
+
+            interrupt_flag = false;
+            mounted = false;
+        
+            opt = -1;
             printf("\nEscolha o comando (h = help):  ");
         }
-        if (cRxedChar == 'c') // Lista diretórios e os arquivos se pressionar 'c'
+        if (opt == 'c') // Lista diretórios e os arquivos se pressionar 'c'
         {
             printf("\nListagem de arquivos no cartão SD.\n");
             strcpy(op, "Listando arquivos...");
             print_op(false);
+
+            clear_led();
+            gpio_put(led[0], true);
+            gpio_put(led[1], true);
+
+            interrupt_flag = true;
+
             run_ls();
+
             if(err_flag)
             {
                 print_error();
+                clear_led();
+                gpio_put(led[0], true);
             }else
             {
                 print_op(true);
+                clear_led();
+                gpio_put(led[1], true);
             }
+
+            interrupt_flag = false;
+            opt = -1;
+
             printf("\nListagem concluída.\n");
             printf("\nEscolha o comando (h = help):  ");
         }
-        if (cRxedChar == 'd') // Exibe o conteúdo do arquivo se pressionar 'd'
+        if (opt == 'd') // Exibe o conteúdo do arquivo se pressionar 'd'
         {
             strcpy(op, "Lendo arquivo");
+
+            clear_led();
+            gpio_put(led[0], true);
+            gpio_put(led[1], true);
+
+            interrupt_flag = false;
+
             read_file(filename);
+
             if(err_flag)
             {
                 print_error();
+                clear_led();
+                gpio_put(led[0], true);
             }else
             {
                 print_op(true);
+                clear_led();
+                gpio_put(led[1], true);
             }
+
+            interrupt_flag = false;
+            opt = -1;
+
             printf("Escolha o comando (h = help):  ");
         }
-        if (cRxedChar == 'e') // Obtém o espaço livre no SD card se pressionar 'e'
+        if (opt == 'e') // Obtém o espaço livre no SD card se pressionar 'e'
         {
             printf("\nObtendo espaço livre no SD.\n\n");
             strcpy(op, "Obtendo Espaco ");
+
+            clear_led();
+            gpio_put(led[0], true);
+            gpio_put(led[1], true);
+
             print_op(false);
+
+            interrupt_flag = true;
+
             run_getfree();
+
             if(err_flag)
             {
                 print_error();
+                clear_led();
+                gpio_put(led[0], true);
+
             }else
             {
 
@@ -311,56 +469,106 @@ int main()
                 ssd1306_draw_string(&ssd, "Kib", strlen(str_free_sct)*8+8, 16);
                 ssd1306_draw_string(&ssd, "Livres", 0, 28);
                 ssd1306_send_data(&ssd);
+
+                clear_led();
+                gpio_put(led[1], true);
             }
+
+            interrupt_flag = false;
+            opt = -1;
+
             printf("\nEspaço livre obtido.\n");
             printf("\nEscolha o comando (h = help):  ");
         }
-        if (cRxedChar == 'f') // Captura dados do MPU e salva no arquivo se pressionar 'f'
+        if (opt == 'f') // Captura dados do MPU e salva no arquivo se pressionar 'f'
         {
             ssd1306_fill(&ssd, !cor);
             ssd1306_draw_string(&ssd, "Capturando Dado", 0, 0);
-            ssd1306_draw_string(&ssd, "Aguarde...", 0, 24);
+            ssd1306_draw_string(&ssd, "Nao Disconecte", 0, 24);
+            ssd1306_draw_string(&ssd, "Aguarde...", 0, 34);
             ssd1306_send_data(&ssd);
+
+            clear_led();
+            gpio_put(led[0], true);
+            gpio_put(led[1], true);
+
+            interrupt_flag = true;
+
             capture_mpu_data_and_save();
+
             if(err_flag)
             {
                 print_error();
+                clear_led();
+                gpio_put(led[0], true);
+
             }else
             {
                 sprintf(str_samples, "%d", samples);
                 ssd1306_fill(&ssd, !cor);
                 ssd1306_draw_string(&ssd, "Dados Salvos!", 0, 0);
-                ssd1306_draw_string(&ssd, "Bytes escritos:", 4, 30);
-                ssd1306_draw_string(&ssd, bytewrite, 4, 39);
-                ssd1306_draw_string(&ssd, str_samples, 4, 50);
-                ssd1306_draw_string(&ssd, "amostras", strlen(str_samples)*8+8, 50);
+                ssd1306_draw_string(&ssd, "Bytes escritos:", 0, 20);
+                ssd1306_draw_string(&ssd, bytewrite, 0, 29);
+                ssd1306_draw_string(&ssd, str_samples, 0, 40);
+                ssd1306_draw_string(&ssd, "amostras", strlen(str_samples)*8+8, 40);
                 ssd1306_send_data(&ssd);
+
+                clear_led();
+                gpio_put(led[1], true);
             }
+
+            interrupt_flag = false;
+            opt = -1;
+
             printf("\nEscolha o comando (h = help):  ");
         }
-        if (cRxedChar == 'g') // Formata o SD card se pressionar 'g'
+        if (opt == 'g') // Formata o SD card se pressionar 'g'
         {
             printf("\nProcesso de formatação do SD iniciado. Aguarde...\n");
             strcpy(op, "Formatando SD");
+
+            clear_led();
+            gpio_put(led[0], true);
+            gpio_put(led[1], true);
+
             print_op(false);
+
+            interrupt_flag = false;
+
             run_format();
+
             if(err_flag)
             {
                 print_error();
+                clear_led();
+                gpio_put(led[0], true);
             }else
             {
                 print_op(true);
+                clear_led();
+                gpio_put(led[1], true);
             }
+
+            interrupt_flag = false;
+            opt = -1;
+
             printf("\nFormatação concluída.\n\n");
             printf("\nEscolha o comando (h = help):  ");
         }
-        if (cRxedChar == 'h') // Exibe os comandos disponíveis se pressionar 'h'
+        if (opt == 'h') // Exibe os comandos disponíveis se pressionar 'h'
         {
             ssd1306_fill(&ssd, !cor);
             ssd1306_draw_string(&ssd, "Aguardando", 4, 4);
             ssd1306_draw_string(&ssd, "Comando...", 4, 13);
             ssd1306_send_data(&ssd);
+
             run_help();
+
+            interrupt_flag = false;
+            opt = -1;
+
+            clear_led();
+            gpio_put(led[1], true);
         }
         sleep_ms(500);
     }
